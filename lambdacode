@@ -1,0 +1,202 @@
+import boto3
+from botocore.config import Config
+
+# Configure boto3 retry strategy
+boto_config = Config(
+   retries = {
+      'max_attempts': 10,
+      'mode': 'standard'
+   }
+)
+
+
+ECS = boto3.client('ecs', config=boto_config)
+
+# Specify the tag keys and values to identify the clusters and services
+CLUSTER_TAG_KEY = 'Test' # Don't need value, only need key for validation
+SERVICE_TAG_KEY = 'Test' #  Don't need value, only need key for validation
+STARTING_COUNT_TAG_KEY = 'StartingCount' # use for setting desired count based on tag value provided
+STOPPING_COUNT_TAG_KEY = 'StoppingCount' # use for setting desired count based on tag value provided
+
+
+def lambda_handler(event, context):
+    print(f"Received the following event: {event}")
+    action = event.get('action')
+
+    if action not in ['stop', 'start']:
+        return {
+            'statusCode': 400,
+            'body': 'Invalid action specified. Please specify either \'stop\' or \'start\'.'
+        }
+
+    # Get clusters with the specified tag
+    clusters = get_clusters_with_tag(CLUSTER_TAG_KEY)
+    
+    if not clusters:
+        message = f"No clusters found with tag {CLUSTER_TAG_KEY}. No action taken."
+        print(message)
+        return {
+            'statusCode': 200,
+            'body': message
+        }
+
+    services_updated = 0
+    updated_services = {}
+    for cluster in clusters:
+        print(f"Processing cluster: {cluster}")
+        services = list_all_services(cluster)
+        updated_services[cluster] = []
+
+        for service in services:
+            # Check if the service has the required tag and schedulingStrategy='REPLICA', avoid update Daemon service by update only replica
+            service_desc = describe_service_with_retry(cluster, service)
+            if service_desc.get('schedulingStrategy') != 'REPLICA':
+                print(f"Skipping {service} in {cluster} as it does not have schedulingStrategy='REPLICA'")
+                continue
+            
+            if not has_tag_key(service_desc.get('tags', []), SERVICE_TAG_KEY):
+                print(f"Skipping {service} in {cluster} as it does not have the required tag")
+                continue
+            
+            # Get desired count from service tags
+            tags = service_desc.get('tags', [])
+            print(f"{tags}")
+            if action == 'start':
+                #Give a default value for starting count if none give 1
+                starting_count_value = get_tag_value(tags, STARTING_COUNT_TAG_KEY)
+                desired_count = int(starting_count_value or 1)
+                print(f"{desired_count}")
+            else: # action == 'stop'
+                #Give a default value for stopping count if none give 0
+                stopping_count_value = get_tag_value(tags, STOPPING_COUNT_TAG_KEY)
+                desired_count = int(stopping_count_value or 0)
+                print(f"{desired_count}")
+           
+
+            print(f"Calling ECS update service to set desired count to {desired_count} for {service} in {cluster}")
+
+            if update_service_with_retry(cluster, service, desired_count):
+                print(f"Update Service call succeeded for {service} in {cluster}.")
+                services_updated += 1
+                updated_services[cluster].append(service)
+            else:
+                print(f"Failed to update service {service} in {cluster} after retries.")
+
+    if services_updated > 0:
+        message = f'{services_updated} ECS services that has specified tag in tagged clusters {"stopped" if action == "stop" else "started"} successfully!'
+    else:
+        message = f'No services with schedulingStrategy=\'REPLICA\' and required tag found in the tagged clusters. No action taken.'
+    
+    return {
+        'statusCode': 200,
+        'body': message
+    }
+
+def get_clusters_with_tag(tag_key):
+    clusters = []
+    response = list_clusters_with_retry()
+    
+    # Describe all clusters at once with tags included
+    cluster_details =  describe_clusters_with_retry(response['clusterArns'])
+    
+    for cluster in cluster_details:
+        cluster_name = cluster['clusterName']
+        tags = cluster.get('tags', [])
+        
+        # Check if the cluster has the specified tag
+        if has_tag_key(tags, tag_key):
+            clusters.append(cluster_name)
+    
+    return clusters
+
+def list_all_services(cluster):
+    services = []
+    next_token = None
+    while True:
+        response = list_services_with_retry(cluster, next_token)
+        services.extend([arn.split('/')[-1] for arn in response['serviceArns']])
+        next_token = response.get('nextToken')
+        if not next_token:
+            break
+    return services
+
+# won't need this since checking only with key now and doesn't require value. 
+def has_required_tag(tags, tag_key, tag_value):
+    return any(tag['key'] == tag_key and tag['value'] == tag_value for tag in tags)
+
+def has_tag_key(tags, tag_key):
+    return any(tag['key'] == tag_key for tag in tags)
+
+def get_tag_value(tags, tag_key):
+    for tag in tags:
+        if tag['key'] == tag_key:
+            return tag['value']
+    return None
+
+# handling retires in case throttle for service update 
+def update_service_with_retry(cluster, service, desired_count, max_retries=10, delay=1):
+    for attempt in range(max_retries):
+        try:
+            ECS.update_service(
+                cluster=cluster,
+                service=service,
+                desiredCount=desired_count
+            )
+            return True
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to update service {service} in cluster {cluster} after {max_retries} attempts: {str(e)}")
+                return False
+            time.sleep(delay)
+    return False
+# handling retires in case throttle for describe service
+def describe_service_with_retry(cluster, service, max_retries=10, delay=1):
+    for attempt in range(max_retries):
+        try:
+            response = ECS.describe_services(cluster=cluster, services=[service], include=['TAGS'])
+            return response['services'][0]
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to describe service {service} in cluster {cluster} after {max_retries} attempts: {str(e)}")
+                raise
+            time.sleep(delay)
+    return None
+
+# handling retires in case throttle for list cluster
+def list_clusters_with_retry(max_retries=3, delay=1):
+    for attempt in range(max_retries):
+        try:
+            return ECS.list_clusters()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to list clusters after {max_retries} attempts: {str(e)}")
+                raise
+            time.sleep(delay)
+    return None
+
+# handling retires in case throttle for describe cluster
+def describe_clusters_with_retry(cluster_arns, max_retries=10, delay=1):
+    for attempt in range(max_retries):
+        try:
+            return ECS.describe_clusters(clusters=cluster_arns, include=['TAGS'])['clusters']
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to describe clusters after {max_retries} attempts: {str(e)}")
+                raise
+            time.sleep(delay)
+    return None
+
+# handling retires in case throttle for list service
+def list_services_with_retry(cluster, next_token=None, max_retries=10, delay=1):
+    for attempt in range(max_retries):
+        try:
+            if next_token:
+                return ECS.list_services(cluster=cluster, nextToken=next_token)
+            else:
+                return ECS.list_services(cluster=cluster)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to list services in cluster {cluster} after {max_retries} attempts: {str(e)}")
+                raise
+            time.sleep(delay)
+    return None
